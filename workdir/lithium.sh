@@ -1,3 +1,4 @@
+# /home/me/Repos/lm-evaluation-harness/.venv/bin/lm_eval
 lm_eval \
   --model local-chat-completions \
   --tasks nortruthfulqa_gen_nob_p5 \
