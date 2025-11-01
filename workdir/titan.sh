@@ -1,4 +1,6 @@
 # Plan: Run evaluations using:
+# /home/me/Repos/lm-evaluation-harness/.venv/bin/lm_eval
+alias lm_eval=/home/me/Repos/lm-evaluation-harness/.venv/bin/lm_eval
 # Models:
 # Datasets: all noreval tasks with configs that work for
 #
