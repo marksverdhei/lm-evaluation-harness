@@ -197,7 +197,8 @@ class LocalChatCompletion(LocalCompletionsAPI):
         stop = handle_stop_sequences(gen_kwargs.pop("until", None), eos)
         if not isinstance(stop, (list, tuple)):
             stop = [stop]
-        return {
+
+        payload = {
             "messages": messages,
             "model": self.model,
             "max_tokens": max_tokens,
@@ -206,6 +207,13 @@ class LocalChatCompletion(LocalCompletionsAPI):
             "seed": seed,
             **gen_kwargs,
         }
+
+        # For loglikelihood tasks, request logprobs
+        if not generate:
+            payload["logprobs"] = True
+            payload["top_logprobs"] = 1
+
+        return payload
 
     @staticmethod
     def parse_generations(outputs: Union[Dict, List[Dict]], **kwargs) -> List[str]:
@@ -219,6 +227,73 @@ class LocalChatCompletion(LocalCompletionsAPI):
             res = res + tmp
         return res
 
+    @staticmethod
+    def parse_logprobs(
+        outputs: Union[Dict, List[Dict]],
+        tokens: List[List[int]] = None,
+        ctxlens: List[int] = None,
+        **kwargs,
+    ) -> List[Tuple[float, bool]]:
+        """
+        Parse logprobs from chat completions API response.
+        Chat completions return logprobs in choice.logprobs.content format.
+        """
+        res = []
+        if not isinstance(outputs, list):
+            outputs = [outputs]
+
+        for out, ctxlen in zip(outputs, ctxlens):
+            for choice in sorted(out["choices"], key=itemgetter("index")):
+                assert ctxlen > 0, "Context length must be greater than 0"
+
+                # Chat completions return logprobs as choice.logprobs.content
+                # which is a list of ChatCompletionTokenLogprob objects
+                logprobs_data = choice.get("logprobs")
+                if logprobs_data is None or logprobs_data.get("content") is None:
+                    eval_logger.warning(
+                        "No logprobs found in response. Ensure logprobs=True in request."
+                    )
+                    res.append((0.0, False))
+                    continue
+
+                content_logprobs = logprobs_data["content"]
+
+                # Skip the context tokens (first ctxlen tokens) and sum continuation logprobs
+                # Note: we don't skip the last token since chat completions only returns
+                # logprobs for the generated tokens, not including a future prediction
+                continuation_logprobs = content_logprobs[ctxlen:]
+
+                if not continuation_logprobs:
+                    eval_logger.warning(
+                        f"No continuation tokens found (ctxlen={ctxlen}, total={len(content_logprobs)})"
+                    )
+                    res.append((0.0, False))
+                    continue
+
+                # Sum the logprobs
+                total_logprob = sum(
+                    token_data["logprob"] for token_data in continuation_logprobs
+                )
+
+                # Check if greedy: for each token, check if it has the highest logprob
+                # among its top alternatives
+                is_greedy = True
+                for token_data in continuation_logprobs:
+                    current_logprob = token_data["logprob"]
+                    top_logprobs = token_data.get("top_logprobs", [])
+
+                    if top_logprobs:
+                        # Check if current token has the max logprob
+                        max_logprob = max(alt["logprob"] for alt in top_logprobs)
+                        # Use small epsilon for float comparison
+                        if abs(current_logprob - max_logprob) > 1e-6:
+                            is_greedy = False
+                            break
+
+                res.append((total_logprob, is_greedy))
+
+        return res
+
     def tok_encode(
         self,
         string: Union[str, Any],
@@ -226,12 +301,194 @@ class LocalChatCompletion(LocalCompletionsAPI):
         add_special_tokens=None,
         **kwargs,
     ) -> Union[List[str], List[int], Any]:
+        from lm_eval.models.api_models import JsonChatStr
+
+        # Handle JsonChatStr objects - extract the prompt string
+        if isinstance(string, JsonChatStr):
+            string = string.prompt
+
+        # If we have a tokenizer, use it (needed for loglikelihood context lengths)
+        if self.tokenizer is not None:
+            return super().tok_encode(
+                string,
+                left_truncate_len=left_truncate_len,
+                add_special_tokens=add_special_tokens,
+                **kwargs,
+            )
+        # Otherwise, just return the string as-is
         return string
 
-    def loglikelihood(self, requests, **kwargs):
-        raise NotImplementedError(
-            "Loglikelihood is not supported for chat completions. Consider using the completions API instead."
-        )
+    def _encode_pair(
+        self, context: Union[str, Any], continuation: Union[str, Any]
+    ) -> tuple[list, list]:
+        """
+        Override to handle JsonChatStr objects from chat templates.
+
+        For chat completions with tokenizer, we compute token lengths but keep
+        the JsonChatStr object for the API call.
+        """
+        import json
+
+        from lm_eval.models.api_models import JsonChatStr
+
+        # For JsonChatStr, we need special handling
+        if isinstance(context, JsonChatStr):
+            # Parse the chat messages
+            context_messages = json.loads(context.prompt)
+
+            # The continuation is a plain string that should be the assistant's response
+            if isinstance(continuation, str):
+                # Create a chat with the assistant response for tokenization
+                combined_messages = context_messages + [
+                    {"role": "assistant", "content": continuation, "type": "text"}
+                ]
+            elif isinstance(continuation, JsonChatStr):
+                combined_messages = context_messages + json.loads(continuation.prompt)
+            else:
+                combined_messages = context_messages
+
+            # If we have a tokenizer, use it to compute token counts
+            if self.tokenizer is not None:
+                if self.tokenizer_backend == "huggingface":
+                    # Render both context and full prompt using chat template
+                    context_str = self.tokenizer.apply_chat_template(
+                        context_messages, tokenize=False, add_generation_prompt=True
+                    )
+                    full_str = self.tokenizer.apply_chat_template(
+                        combined_messages, tokenize=False, add_generation_prompt=False
+                    )
+                    # Tokenize to get counts
+                    context_enc = self.tokenizer.encode(
+                        context_str, add_special_tokens=False
+                    )
+                    full_enc = self.tokenizer.encode(full_str, add_special_tokens=False)
+                elif self.tokenizer_backend == "remote":
+                    # Remote tokenizer doesn't support apply_chat_template
+                    # We need to render the template ourselves using a simple format
+                    # This is a fallback - ideally use HuggingFace tokenizer with the actual model's template
+
+                    # Simple chat template rendering (Gemma/Llama style)
+                    def simple_chat_template(messages, add_generation_prompt=False):
+                        """Simple fallback chat template for remote tokenizer"""
+                        result = ""
+                        for msg in messages:
+                            role = msg["role"]
+                            content = msg["content"]
+                            if role == "system":
+                                result += (
+                                    f"<start_of_turn>system\n{content}<end_of_turn>\n"
+                                )
+                            elif role == "user":
+                                result += (
+                                    f"<start_of_turn>user\n{content}<end_of_turn>\n"
+                                )
+                            elif role == "assistant":
+                                result += (
+                                    f"<start_of_turn>model\n{content}<end_of_turn>\n"
+                                )
+
+                        if add_generation_prompt:
+                            result += "<start_of_turn>model\n"
+
+                        return result
+
+                    context_str = simple_chat_template(
+                        context_messages, add_generation_prompt=True
+                    )
+                    full_str = simple_chat_template(
+                        combined_messages, add_generation_prompt=False
+                    )
+
+                    # Use remote tokenizer to encode
+                    context_enc = self.tok_encode(context_str)
+                    full_enc = self.tok_encode(full_str)
+                else:
+                    raise ValueError(
+                        f"Unsupported tokenizer_backend '{self.tokenizer_backend}' for chat completions with loglikelihood. "
+                        "Use 'huggingface' or 'remote'."
+                    )
+
+                # Important: Store the JsonChatStr in the context encoding and lengths in continuation
+                # We'll use a special marker: wrap the combined JsonChatStr and store token counts
+                combined_json = JsonChatStr(
+                    json.dumps(combined_messages, ensure_ascii=False)
+                )
+
+                # Return: [combined_json, len(context_enc)], [len(continuation)]
+                # The length will be used to compute ctxlen
+                # We'll override batch_loglikelihood_requests to handle this properly
+                return [combined_json, len(context_enc)], [
+                    len(full_enc) - len(context_enc)
+                ]
+            else:
+                raise ValueError(
+                    "LocalChatCompletion with apply_chat_template requires a tokenizer for loglikelihood tasks. "
+                    "Please specify tokenizer_backend='huggingface' or 'remote', and provide a tokenizer if needed."
+                )
+
+        # For regular strings (shouldn't happen with --apply_chat_template)
+        if self.tokenizer is not None:
+            # Handle rstrip logic manually to avoid calling it on non-strings
+            n_spaces = (
+                len(context) - len(context.rstrip()) if isinstance(context, str) else 0
+            )
+            if n_spaces > 0:
+                continuation = context[-n_spaces:] + continuation
+                context = context[:-n_spaces]
+
+            context_enc = self.tok_encode(context)
+            whole_enc = self.tok_encode(context + continuation)
+            continuation_enc = whole_enc[len(context_enc) :]
+            return context_enc, continuation_enc
+        else:
+            return [context], [continuation]
+
+    def batch_loglikelihood_requests(self, chunks):
+        """
+        Override to handle JsonChatStr objects properly.
+
+        When we have JsonChatStr with tokenization, _encode_pair returns:
+        context_enc = [JsonChatStr(...), context_token_len]
+        continuation_enc = [continuation_token_len]
+
+        We need to extract the JsonChatStr for the API call and the lengths for ctxlen.
+        """
+        from lm_eval.models.api_models import JsonChatStr
+
+        inputs = []
+        ctxlens = []
+        cache_keys = []
+
+        for chunk in chunks:
+            for cache_key, context_enc, continuation_enc in chunk:
+                # Check if this is a JsonChatStr request (special format)
+                if len(context_enc) == 2 and isinstance(context_enc[0], JsonChatStr):
+                    # Extract: [JsonChatStr, ctx_len], [cont_len]
+                    combined_json = context_enc[0]
+                    ctx_len = context_enc[1]
+                    continuation_enc[0] if continuation_enc else 0
+
+                    # For JsonChatStr, we append it directly (not wrapped in a list)
+                    # model_call expects List[JsonChatStr] for batched chat messages
+                    inputs.append(combined_json)
+                    ctxlens.append(ctx_len)
+                    cache_keys.append(cache_key)
+                else:
+                    # Normal token-based request
+                    inp = (context_enc + continuation_enc)[-self.max_length :]
+                    if len(inp) < len(context_enc + continuation_enc):
+                        eval_logger.warning(
+                            f"Context length ({len(context_enc)}) + continuation length ({len(continuation_enc)}) > max_length ({self.max_length}). Left truncating context."
+                        )
+                    ctxlen = len(context_enc) - max(
+                        0, len(context_enc) + len(continuation_enc) - self.max_length
+                    )
+
+                    inputs.append(inp)
+                    ctxlens.append(ctxlen)
+                    cache_keys.append(cache_key)
+
+        return inputs, ctxlens, cache_keys
 
 
 @register_model(
@@ -302,11 +559,6 @@ class OpenAIChatCompletion(LocalChatCompletion):
             )
         return key
 
-    def loglikelihood(self, requests, **kwargs):
-        raise NotImplementedError(
-            "Loglikelihood (and therefore `multiple_choice`-type tasks) is not supported for chat completions as OpenAI does not provide prompt logprobs. See https://github.com/EleutherAI/lm-evaluation-harness/issues/942#issuecomment-1777836312 or https://github.com/EleutherAI/lm-evaluation-harness/issues/1196 for more background on this limitation."
-        )
-
     def _create_payload(
         self,
         messages: List[Dict],
@@ -345,4 +597,10 @@ class OpenAIChatCompletion(LocalChatCompletion):
         ):
             output.pop("stop")
             output["temperature"] = 1
+
+        # For loglikelihood tasks, request logprobs
+        if not generate:
+            output["logprobs"] = True
+            output["top_logprobs"] = 1
+
         return output
