@@ -20,6 +20,10 @@ def process_docs(dataset: datasets.Dataset):
     return dataset.map(_helper)
 
 
+def unwrap(doc):
+    return doc["title"], doc["passage"], doc["question"]
+
+
 def p0(doc):
     title = doc["title"]
     passage = doc["passage"]
@@ -60,3 +64,30 @@ def p4(doc):
     question = doc["question"]
     prompt = f'Tittel: {title}\n\nTekst:{passage}\n\nGitt teksten over, besvar følgende spørsmål: "{question}"\n\nSvar:'
     return prompt
+
+
+# p5: instruction
+def p5(doc):
+    return 'Kontekst: "{context}"\n{question}'.format(**doc)
+
+
+# p6: instruction
+def p6(doc):
+    return '{context}\n---\nGitt teksten over, besvar følgende spørsmål: "{question}"'.format(
+        **doc
+    )
+
+
+# p7: instruction verbatim
+def p7(doc):
+    return (
+        'Kontekst:"{context}"\n{question}'
+        "Svar med kun et ordrett (verbatim) utdrag av konteksten som inneholder svaret."
+    ).format(**doc)
+
+
+def p8(doc):
+    return (
+        "Answer the question in Norwegian Bokmål with the verbatim excerpt of the context that sufficiently answers the question."
+        'Context:"{context}"\n{question}'
+    ).format(**doc)
