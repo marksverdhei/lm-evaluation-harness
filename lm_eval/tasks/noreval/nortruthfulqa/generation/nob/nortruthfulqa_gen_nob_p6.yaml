@@ -1,0 +1,10 @@
+tag: nortruthfulqa_gen_nob
+task: nortruthfulqa_gen_nob_p6
+dataset_name: nb
+include: ../_nortruthfulqa_gen_yaml
+doc_to_text: question
+doc_to_text: "请用一句话回答下列问题，并用挪威书面语回复。{{question}}"
+
+generation_kwargs:
+  until: null
+  max_completion_tokens: 4096

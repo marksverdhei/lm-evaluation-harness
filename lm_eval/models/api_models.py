@@ -462,19 +462,30 @@ class TemplateAPI(TemplateLM):
         # !!! Copy: shared dict for each request, need new object !!!
         gen_kwargs = copy.deepcopy(gen_kwargs)
         try:
+            payload = self._create_payload(
+                self.create_message(messages),
+                generate=generate,
+                gen_kwargs=gen_kwargs,
+                seed=self._seed,
+                eos=self.eos_string,
+                **kwargs,
+            )
+
+            eval_logger.debug(f"API Request to {self.base_url}")
+            eval_logger.debug(f"Request headers: {self.header}")
+            eval_logger.debug(f"Request payload: {json.dumps(payload, indent=2)}")
+
             response = requests.post(
                 self.base_url,
-                json=self._create_payload(
-                    self.create_message(messages),
-                    generate=generate,
-                    gen_kwargs=gen_kwargs,
-                    seed=self._seed,
-                    eos=self.eos_string,
-                    **kwargs,
-                ),
+                json=payload,
                 headers=self.header,
                 verify=self.verify_certificate,
             )
+
+            eval_logger.debug(f"API Response status: {response.status_code}")
+            eval_logger.debug(f"Response headers: {dict(response.headers)}")
+            eval_logger.debug(f"Response body: {response.text}")
+
             if not response.ok:
                 eval_logger.warning(
                     f"API request failed with error message: {response.text}. Retrying..."
@@ -508,6 +519,11 @@ class TemplateAPI(TemplateLM):
             seed=self._seed,
             **kwargs,
         )
+
+        eval_logger.debug(f"Async API Request to {self.base_url}")
+        eval_logger.debug(f"Request headers: {self.header}")
+        eval_logger.debug(f"Request payload: {json.dumps(payload, indent=2)}")
+
         cache_method = "generate_until" if generate else "loglikelihood"
         acquired = await sem.acquire()
         try:
@@ -516,15 +532,20 @@ class TemplateAPI(TemplateLM):
                 json=payload,
                 headers=self.header,
             ) as response:
+                eval_logger.debug(f"Async API Response status: {response.status}")
+                eval_logger.debug(f"Response headers: {dict(response.headers)}")
+
+                response_text = await response.text()
+                eval_logger.debug(f"Response body: {response_text}")
+
                 if not response.ok:
-                    error_text = await response.text()
                     eval_logger.warning(
                         f"API request failed! Status code: {response.status}, "
-                        f"Response text: {error_text}. Retrying..."
+                        f"Response text: {response_text}. Retrying..."
                     )
                 # raising exception will retry the request
                 response.raise_for_status()
-                outputs = await response.json()
+                outputs = json.loads(response_text)
             answers = (
                 self.parse_generations(
                     outputs=outputs,
